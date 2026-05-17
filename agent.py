@@ -28,7 +28,8 @@ import atexit
 import datetime
 import warnings
 import wave
-import struct 
+import struct
+import contextlib
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
@@ -67,7 +68,9 @@ DEFAULT_CONFIG = {
     "camera_rotation": 0,
     "system_prompt_extras": "",
     "input_device": None,
-    "input_sample_rate": None
+    "input_sample_rate": None,
+    "whisper_model": "ggml-base.en.bin",
+    "whisper_lang": "en",
 }
 
 # LLM SETTINGS
@@ -78,6 +81,16 @@ OLLAMA_OPTIONS = {
     'top_k': 40,
     'top_p': 0.9
 }
+
+@contextlib.contextmanager
+def timed_block(label):
+    t0 = time.perf_counter()
+    print(f"[TIMER] >>> {label}", flush=True)
+    try:
+        yield
+    finally:
+        print(f"[TIMER] <<< {label}  {time.perf_counter()-t0:.2f}s", flush=True)
+
 
 def load_config():
     config = DEFAULT_CONFIG.copy()
@@ -191,7 +204,7 @@ You: {"action": "capture_image", "value": "environment"}
 ### END EXAMPLES ###
 """
 
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+SYSTEM_PROMPT = CURRENT_CONFIG.get("system_prompt", BASE_SYSTEM_PROMPT) + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
 
 # Sound Directories
 greeting_sounds_dir = "sounds/greeting_sounds"
@@ -547,7 +560,8 @@ class BotGUI:
                 
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
-                self.chat_and_respond(user_text, img_path=None)
+                with timed_block("完整一轮对话"):
+                    self.chat_and_respond(user_text, img_path=None)
                     
         except Exception as e:
             traceback.print_exc()
@@ -773,11 +787,16 @@ class BotGUI:
 
     def transcribe_audio(self, filename):
         print("Transcribing...", flush=True)
+        whisper_model = CURRENT_CONFIG.get("whisper_model", "ggml-base.en.bin")
+        whisper_lang  = CURRENT_CONFIG.get("whisper_lang", "en")
         try:
-            result = subprocess.run(
-                ["./whisper.cpp/build/bin/whisper-cli", "-m", "./whisper.cpp/models/ggml-base.en.bin", "-l", "en", "-t", "4", "-f", filename],
-                capture_output=True, text=True
-            )
+            with timed_block("STT whisper-cli"):
+                result = subprocess.run(
+                    ["./whisper.cpp/build/bin/whisper-cli",
+                     "-m", f"./whisper.cpp/models/{whisper_model}",
+                     "-l", whisper_lang, "-t", "4", "-f", filename],
+                    capture_output=True, text=True
+                )
             transcription_lines = result.stdout.strip().split('\n')
             if transcription_lines and transcription_lines[-1].strip():
                 last_line = transcription_lines[-1].strip()
@@ -825,7 +844,9 @@ class BotGUI:
         if img_path:
             messages = [{"role": "user", "content": text, "images": [img_path]}]
         else:
-            user_msg = {"role": "user", "content": text}
+            lang = CURRENT_CONFIG.get("whisper_lang", "en")
+            lang_hint = "请用中文回答。" if lang == "zh" else ""
+            user_msg = {"role": "user", "content": text + ("\n" + lang_hint if lang_hint else "")}
             messages = self.permanent_memory + self.session_memory + [user_msg]
         
         self.thinking_sound_active.set()
@@ -838,10 +859,15 @@ class BotGUI:
             stream = ollama.chat(model=model_to_use, messages=messages, stream=True, options=OLLAMA_OPTIONS)
             
             is_action_mode = False
-            
+            _t_llm = time.perf_counter()
+            _ttft_logged = False
+
             for chunk in stream:
-                if self.interrupted.is_set(): break 
+                if self.interrupted.is_set(): break
                 content = chunk['message']['content']
+                if not _ttft_logged:
+                    print(f"[TIMER] LLM 首Token延迟 {time.perf_counter()-_t_llm:.2f}s", flush=True)
+                    _ttft_logged = True
                 full_response_buffer += content
                 
                 if '{"' in content or "action:" in content.lower():
@@ -861,7 +887,7 @@ class BotGUI:
                 sentence_buffer += content
                 if any(punct in content for punct in ".!?\n"):
                     clean_sentence = sentence_buffer.strip()
-                    if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
+                    if clean_sentence and re.search(r'[\w一-鿿]', clean_sentence):
                         with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
                     sentence_buffer = ""
 
@@ -958,61 +984,67 @@ class BotGUI:
                 self.speak(text)
                 self.tts_active.clear() 
             else: time.sleep(0.05)
-    #change
+
     def speak(self, text):
-        clean = re.sub(r"[^\w\s,.!?:-]", "", text)
+        clean = re.sub(r"[^\w\s,.!?:-，。！？、；：]", "", text)
         if not clean.strip(): return
-        
-        print(f"[PIPER SPEAKING] '{clean}'", flush=True)
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
-        
-        try:
-            self.current_audio_process = subprocess.Popen(
-                ["./piper/piper", "--model", voice_model, "--output-raw"], 
-                stdin=subprocess.PIPE, 
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            
-            self.current_audio_process.stdin.write(clean.encode() + b'\n')
-            self.current_audio_process.stdin.close()
 
-            PIPER_RATE = 22050
-            HARDWARE_RATE = 48000    # 你的声卡只支持这个采样率
+        with timed_block(f"TTS piper [{clean[:15]}...]"):
+            print(f"[PIPER SPEAKING] '{clean}'", flush=True)
+            voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
 
-            # 输出到硬件设备 hw:2,0，48000 Hz 立体声; change it to mono
-            with sd.RawOutputStream(samplerate=HARDWARE_RATE, channels=2, dtype='int16',
-                                    device="hw:2,0", latency='low', blocksize=2048) as stream:
-                while True:
-                    if self.interrupted.is_set():
-                        break
-                    data = self.current_audio_process.stdout.read(4096)
-                    if not data:
-                        break
-                    
-                    audio_chunk = np.frombuffer(data, dtype=np.int16)
-                    if len(audio_chunk) > 0:
-                        self.current_volume = np.max(np.abs(audio_chunk))
-                        # 重采样到 48000 Hz
-                        num_samples = int(len(audio_chunk) * (HARDWARE_RATE / PIPER_RATE))
-                        resampled = scipy.signal.resample(audio_chunk, num_samples).astype(np.int16)
-                        # 转换为立体声（左右声道相同）
-                        stereo = np.column_stack((resampled, resampled)).flatten()
-                        stream.write(stereo.tobytes())
-                    else:
-                        self.current_volume = 0
-                time.sleep(0.5)
-                    
-        except Exception as e:
-            print(f"Audio Error: {e}")
-        finally:
-            self.current_volume = 0
-            if self.current_audio_process:
-                if self.current_audio_process.stdout:
-                    self.current_audio_process.stdout.close()
-                if self.current_audio_process.poll() is None:
-                    self.current_audio_process.terminate()
-                self.current_audio_process = None
+            try:
+                self.current_audio_process = subprocess.Popen(
+                    ["./piper/piper", "--model", voice_model, "--output-raw"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL
+                )
+
+                self.current_audio_process.stdin.write(clean.encode() + b'\n')
+                self.current_audio_process.stdin.close()
+
+                try:
+                    device_info = sd.query_devices(kind='output')
+                    native_rate = int(device_info['default_samplerate'])
+                except:
+                    native_rate = 48000
+
+                PIPER_RATE = 22050
+                use_native_rate = False
+
+                try:
+                    sd.check_output_settings(device=None, samplerate=PIPER_RATE)
+                except:
+                    use_native_rate = True
+
+                with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE,
+                                        channels=1, dtype='int16',
+                                        device=None, latency='low', blocksize=2048) as stream:
+                    while True:
+                        if self.interrupted.is_set(): break
+                        data = self.current_audio_process.stdout.read(4096)
+                        if not data: break
+
+                        audio_chunk = np.frombuffer(data, dtype=np.int16)
+                        if len(audio_chunk) > 0:
+                            self.current_volume = np.max(np.abs(audio_chunk))
+                            if use_native_rate:
+                                num_samples = int(len(audio_chunk) * (native_rate / PIPER_RATE))
+                                audio_chunk = scipy.signal.resample(audio_chunk, num_samples).astype(np.int16)
+                            stream.write(audio_chunk.tobytes())
+                        else:
+                            self.current_volume = 0
+                    time.sleep(0.5)
+
+            except Exception as e:
+                print(f"Audio Error: {e}")
+            finally:
+                self.current_volume = 0
+                if self.current_audio_process:
+                    if self.current_audio_process.stdout: self.current_audio_process.stdout.close()
+                    if self.current_audio_process.poll() is None: self.current_audio_process.terminate()
+                    self.current_audio_process = None
 
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)
@@ -1051,23 +1083,29 @@ class BotGUI:
                 num_samples = int(len(audio) * (native_rate / file_sr))
                 audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
 
-            sd.play(audio, playback_rate, device="hw:2,0")
+            sd.play(audio, playback_rate)
             sd.wait() 
         except: pass
 
     def load_chat_history(self):
+        system_msg = {"role": "system", "content": SYSTEM_PROMPT}
         if os.path.exists(MEMORY_FILE):
             try:
-                with open(MEMORY_FILE, "r") as f: return json.load(f)
+                with open(MEMORY_FILE, "r") as f:
+                    turns = json.load(f)
+                # memory.json 只存对话轮次，不存 system message
+                turns = [t for t in turns if t.get("role") != "system"]
+                return [system_msg] + turns
             except: pass
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+        return [system_msg]
 
     def save_chat_history(self):
         full = self.permanent_memory + self.session_memory
-        conv = full[1:]
-        if len(conv) > 10: conv = conv[-10:]
-        with open(MEMORY_FILE, "w") as f: 
-            json.dump([full[0]] + conv, f, indent=4)
+        # 只保存 user/assistant 轮次，system prompt 是配置不是历史
+        turns = [t for t in full if t.get("role") != "system"]
+        if len(turns) > 10: turns = turns[-10:]
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(turns, f, indent=4)
 
 if __name__ == "__main__":
     print("--- SYSTEM STARTING ---", flush=True)

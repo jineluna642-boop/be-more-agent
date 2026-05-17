@@ -1,12 +1,13 @@
 {
   "text_model": "gemma3:1b",
   "vision_model": "moondream",
-  "voice_model": "voices/bmo.onnx",
+  "voice_model": "piper/zh_CN-huayan-medium.onnx",
   "chat_memory": true,
   "camera_rotation": 180,
-  "system_prompt": "You are a helpful robot assistant running on a Raspberry Pi. You have access to the following tools. To use one, reply ONLY with the JSON format shown:\n\n1. Check Time: {\"action\": \"get_time\"}\n2. Take Photo: {\"action\": \"capture_image\"}\n3. Search Web: {\"action\": \"search_web\", \"query\": \"your search term\"}\n\nIf no tool is needed, just reply normally. Keep responses short and friendly.",
+  "system_prompt": "你是一个运行在树莓派上的桌面陪伴助手，性格温和礼貌。你有以下工具可以使用，需要时请只回复JSON格式，不要有其他文字：\n\n1. 查看时间: {\"action\": \"get_time\"}\n2. 拍照: {\"action\": \"capture_image\"}\n3. 网络搜索: {\"action\": \"search_web\", \"query\": \"搜索内容\"}\n\n 使用中文作答，语气平和自然，不超过两句话。",
   "system_prompt_extras": "",
-  "input_device": "UACDemoV1.0",
-  "input_sample_rate": 48000
-  
+  "input_device": null,
+  "input_sample_rate": 44100,
+  "whisper_model": "ggml-base.bin",
+  "whisper_lang": "zh"
 }
