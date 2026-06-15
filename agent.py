@@ -804,6 +804,8 @@ class BotGUI:
         try:
             import sherpa_onnx
             model_dir = CURRENT_CONFIG.get("sherpa_model_dir", "sherpa-models/vits-zh-aishell3")
+            num_threads = CURRENT_CONFIG.get("sherpa_num_threads", 4)
+            print(f"[INIT] Sherpa num_threads (from config) = {num_threads}", flush=True)
             cfg = sherpa_onnx.OfflineTtsConfig(
                 model=sherpa_onnx.OfflineTtsModelConfig(
                     vits=sherpa_onnx.OfflineTtsVitsModelConfig(
@@ -812,8 +814,9 @@ class BotGUI:
                         tokens=f"{model_dir}/tokens.txt",
                     ),
                     # 默认单线程合成在 Pi 上慢到 ~0.5s/字；吃满多核可砍掉一半以上耗时。
-                    num_threads=CURRENT_CONFIG.get("sherpa_num_threads", 4),
+                    num_threads=num_threads,
                     provider="cpu",
+                    debug=True,   # 排查用：初始化时打印实际生效的 config（含 num_threads）
                 ),
                 rule_fsts=(
                     f"{model_dir}/date.fst,"
