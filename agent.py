@@ -26,7 +26,6 @@ import select
 import traceback
 import atexit
 import wave
-import contextlib
 
 # Core dependencies
 import sounddevice as sd
@@ -39,148 +38,21 @@ from openwakeword.model import Model
 import ollama
 
 # =========================================================================
-# 1. CONFIGURATION & CONSTANTS
+# 1. 配置 / 提示词从内部模块导入（拆出 config.py / prompts.py）
 # =========================================================================
-
-CONFIG_FILE = "config.json"
-MEMORY_FILE = "memory.json"
-WAKE_WORD_MODEL = "./wakeword.onnx"
-WAKE_WORD_THRESHOLD = 0.5
-
-# HARDWARE SETTINGS
-INPUT_DEVICE_NAME = None
-
-DEFAULT_CONFIG = {
-    "text_model": "gemma3:1b",
-    "voice_model": "piper/en_GB-semaine-medium.onnx",
-    "chat_memory": True,
-    "system_prompt_extras": "",
-    "input_device": None,
-    "input_sample_rate": None,
-    "whisper_model": "ggml-base.en.bin",
-    "whisper_lang": "en",
-}
-
-# LLM SETTINGS
-OLLAMA_OPTIONS = {
-    'keep_alive': '-1',     
-    'num_thread': 4,
-    'temperature': 0.7,     
-    'top_k': 40,
-    'top_p': 0.9
-}
-
-@contextlib.contextmanager
-def timed_block(label):
-    t0 = time.perf_counter()
-    print(f"[TIMER] >>> {label}", flush=True)
-    try:
-        yield
-    finally:
-        print(f"[TIMER] <<< {label}  {time.perf_counter()-t0:.2f}s", flush=True)
-
-
-def load_config():
-    config = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                user_config = json.load(f)
-                config.update(user_config)
-        except Exception as e:
-            print(f"Config Error: {e}. Using defaults.")
-    return config
-
-CURRENT_CONFIG = load_config()
-TEXT_MODEL = CURRENT_CONFIG["text_model"]
-
-def resolve_input_device(config):
-    requested = config.get("input_device")
-    if requested in (None, "", "default"):
-        return None
-
-    try:
-        devices = sd.query_devices()
-    except Exception as e:
-        print(f"[AUDIO] Device query failed: {e}", flush=True)
-        return None
-
-    if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
-        index = int(requested)
-        if 0 <= index < len(devices):
-            return index
-        print(f"[AUDIO] Input device index not found: {index}", flush=True)
-        return None
-
-    requested_lower = str(requested).lower()
-    for idx, dev in enumerate(devices):
-        print(f"[AUDIO DEBUG] Index {idx}: {dev.get('name')} (In: {dev.get('max_input_channels')})", flush=True) # DEBUG LINE
-        if dev.get("max_input_channels", 0) > 0 and requested_lower in dev.get("name", "").lower():
-            return idx
-
-    print(f"[AUDIO] Input device name not found: {requested}", flush=True)
-    return None
-
-INPUT_DEVICE_NAME = resolve_input_device(CURRENT_CONFIG)
-if INPUT_DEVICE_NAME is not None:
-    try:
-        device_info = sd.query_devices(INPUT_DEVICE_NAME)
-        print(f"[AUDIO] Using input device: {device_info.get('name', INPUT_DEVICE_NAME)}", flush=True)
-    except Exception:
-        print(f"[AUDIO] Using input device index: {INPUT_DEVICE_NAME}", flush=True)
-
-def choose_input_samplerate(device, preferred=None):
-    candidates = []
-    if preferred:
-        candidates.append(preferred)
-    try:
-        device_info = sd.query_devices(device)
-        print(f"[AUDIO DEBUG] Device Info: {device_info}", flush=True) # DEBUG
-        if "default_samplerate" in device_info:
-            candidates.append(int(device_info["default_samplerate"]))
-    except Exception as e:
-        print(f"[AUDIO DEBUG] Query failed: {e}", flush=True)
-        pass
-
-    candidates.extend([48000, 44100, 32000, 16000])
-    seen = set()
-    for rate in candidates:
-        if not rate or rate in seen:
-            continue
-        seen.add(rate)
-        try:
-            sd.check_input_settings(device=device, samplerate=rate, channels=1, dtype="int16")
-            return rate
-        except Exception:
-            continue
-
-    return int(candidates[0]) if candidates else 44100
-
-class BotStates:
-    IDLE = "idle"             
-    LISTENING = "listening"   
-    THINKING = "thinking"     
-    SPEAKING = "speaking"     
-    ERROR = "error"           
-    CAPTURING = "capturing" 
-    WARMUP = "warmup"       
-
-# --- SYSTEM PROMPT ---
-# 档1: 去掉原英文工具调用 prompt（拍照/搜索已删）。这是 config.json 缺失时的兜底；
-# 正式的睡前梳理 prompt（窄 prompt + few-shot）在档2由 config.json / prompts.py 提供。
-BASE_SYSTEM_PROMPT = """你是一个睡前陪伴机器人，帮用户在睡前梳理情绪。
-说话温和、简短，每次回应不超过两句话。
-只负责接住用户当下这一句，不出主意、不深挖、不在睡前帮用户解决烦心事。"""
-
-SYSTEM_PROMPT = CURRENT_CONFIG.get("system_prompt", BASE_SYSTEM_PROMPT) + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+from config import (
+    MEMORY_FILE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD,
+    INPUT_DEVICE_NAME, OLLAMA_OPTIONS, CURRENT_CONFIG, TEXT_MODEL,
+    BotStates, timed_block, choose_input_samplerate,
+)
+from prompts import SYSTEM_PROMPT
 
 # =========================================================================
 # 2. GUI CLASS
 # =========================================================================
 
 class BotGUI:
-    BG_WIDTH, BG_HEIGHT = 800, 480 
-    OVERLAY_WIDTH, OVERLAY_HEIGHT = 400, 300 
+    BG_WIDTH, BG_HEIGHT = 800, 480
 
     def __init__(self, master):
         self.master = master
@@ -198,8 +70,7 @@ class BotGUI:
         self.current_volume = 0 
         self.animations = {}
         self.current_frame_index = 0
-        self.current_overlay_image = None
-        
+
         self.permanent_memory = self.load_chat_history()
         self.session_memory = []
 
@@ -241,12 +112,9 @@ class BotGUI:
         # GUI Setup
         self.background_label = tk.Label(master)
         self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
-        self.background_label.bind('<Button-1>', self.toggle_hud_visibility) 
-        
-        self.overlay_label = tk.Label(master, bg='black')
-        self.overlay_label.bind('<Button-1>', self.toggle_hud_visibility)
-        
-        self.response_text = tk.Text(master, height=6, width=60, wrap=tk.WORD, 
+        self.background_label.bind('<Button-1>', self.toggle_hud_visibility)
+
+        self.response_text = tk.Text(master, height=6, width=60, wrap=tk.WORD,
                                      state=tk.DISABLED, bg="#ffffff", fg="#000000", font=('Arial', 12)) 
         
         self.status_var = tk.StringVar(value="Initializing...")
@@ -332,7 +200,7 @@ class BotGUI:
 
     def load_animations(self):
         base_path = "faces"
-        states = ["idle", "listening", "thinking", "speaking", "error", "capturing", "warmup"] 
+        states = ["idle", "listening", "thinking", "speaking", "error", "warmup"]
         for state in states:
             folder = os.path.join(base_path, state)
             self.animations[state] = []
@@ -368,22 +236,13 @@ class BotGUI:
         speed = 50 if self.current_state == BotStates.SPEAKING else 500
         self.master.after(speed, self.update_animation)
 
-    def set_state(self, state, msg="", cam_path=None):
+    def set_state(self, state, msg=""):
         def _update():
             if msg: print(f"[STATE] {state.upper()}: {msg}", flush=True)
             if self.current_state != state:
                 self.current_state = state
                 self.current_frame_index = 0
             if msg: self.status_var.set(msg)
-            if cam_path and os.path.exists(cam_path) and state in [BotStates.THINKING, BotStates.SPEAKING]:
-                try:
-                    img = Image.open(cam_path).resize((self.OVERLAY_WIDTH, self.OVERLAY_HEIGHT))
-                    self.current_overlay_image = ImageTk.PhotoImage(img)
-                    self.overlay_label.config(image=self.current_overlay_image)
-                    self.overlay_label.place(x=200, y=90)
-                except: pass
-            else:
-                self.overlay_label.place_forget()
         self.master.after(0, _update)
 
     def append_to_text(self, text, newline=True):
