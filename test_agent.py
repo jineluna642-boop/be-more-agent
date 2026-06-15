@@ -1,5 +1,8 @@
 import re
+<<<<<<< HEAD
+=======
 import json
+>>>>>>> 1f88e85856a3fcf12e037e6633a5cf6ee5113ada
 
 
 # --- 测试1：中文 bug ---
@@ -30,8 +33,6 @@ def test_whisper_config_defaults():
     lang  = config.get("whisper_lang", "en")
     assert model == "ggml-base.en.bin"
     assert lang  == "en"
-
-
 # --- 测试4：JSON 动作解析 ---
 def test_action_json_parse():
     text = '{"action": "get_time", "value": "now"}'

@@ -25,27 +25,18 @@ import sys
 import select
 import traceback
 import atexit
-import datetime
-import warnings
 import wave
-import struct
 import contextlib
-
-# Suppress harmless library warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
 
 # Core dependencies
 import sounddevice as sd
 import numpy as np
-import scipy.signal 
+import scipy.signal
 
 # --- AI ENGINES ---
 import openwakeword
 from openwakeword.model import Model
-import ollama 
-
-# --- WEB SEARCH (Using your working import) ---
-from duckduckgo_search import DDGS 
+import ollama
 
 # =========================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -53,7 +44,6 @@ from duckduckgo_search import DDGS
 
 CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
-BMO_IMAGE_FILE = "current_image.jpg"
 WAKE_WORD_MODEL = "./wakeword.onnx"
 WAKE_WORD_THRESHOLD = 0.5
 
@@ -62,10 +52,8 @@ INPUT_DEVICE_NAME = None
 
 DEFAULT_CONFIG = {
     "text_model": "gemma3:1b",
-    "vision_model": "moondream",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": True,
-    "camera_rotation": 0,
     "system_prompt_extras": "",
     "input_device": None,
     "input_sample_rate": None,
@@ -105,7 +93,6 @@ def load_config():
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
-VISION_MODEL = CURRENT_CONFIG["vision_model"]
 
 def resolve_input_device(config):
     requested = config.get("input_device")
@@ -179,38 +166,13 @@ class BotStates:
     WARMUP = "warmup"       
 
 # --- SYSTEM PROMPT ---
-BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry Pi.
-Personality: Cute, helpful, robot.
-Style: Short sentences. Enthusiastic.
-
-INSTRUCTIONS:
-- If the user asks for a physical action (time, search, photo), output JSON.
-- If the user just wants to chat, reply with NORMAL TEXT.
-
-### EXAMPLES ###
-
-User: What time is it?
-You: {"action": "get_time", "value": "now"}
-
-User: Hello!
-You: Hi! I am ready to help!
-
-User: Search for news about robots.
-You: {"action": "search_web", "value": "robots news"}
-
-User: What do you see right now?
-You: {"action": "capture_image", "value": "environment"}
-
-### END EXAMPLES ###
-"""
+# 档1: 去掉原英文工具调用 prompt（拍照/搜索已删）。这是 config.json 缺失时的兜底；
+# 正式的睡前梳理 prompt（窄 prompt + few-shot）在档2由 config.json / prompts.py 提供。
+BASE_SYSTEM_PROMPT = """你是一个睡前陪伴机器人，帮用户在睡前梳理情绪。
+说话温和、简短，每次回应不超过两句话。
+只负责接住用户当下这一句，不出主意、不深挖、不在睡前帮用户解决烦心事。"""
 
 SYSTEM_PROMPT = CURRENT_CONFIG.get("system_prompt", BASE_SYSTEM_PROMPT) + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
-
-# Sound Directories
-greeting_sounds_dir = "sounds/greeting_sounds"
-ack_sounds_dir = "sounds/ack_sounds"
-thinking_sounds_dir = "sounds/thinking_sounds"
-error_sounds_dir = "sounds/error_sounds"
 
 # =========================================================================
 # 2. GUI CLASS
@@ -240,8 +202,7 @@ class BotGUI:
         
         self.permanent_memory = self.load_chat_history()
         self.session_memory = []
-        self.thinking_sound_active = threading.Event()
-        
+
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
         self.recording_active = threading.Event() 
@@ -272,6 +233,11 @@ class BotGUI:
         else:
             print(f"[CRITICAL] Model not found: {WAKE_WORD_MODEL}")
 
+        # --- SHERPA TTS INITIALIZATION ---
+        self.sherpa_tts = None
+        if CURRENT_CONFIG.get("tts_engine") == "sherpa":
+            self._init_sherpa_tts()
+
         # GUI Setup
         self.background_label = tk.Label(master)
         self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
@@ -295,14 +261,6 @@ class BotGUI:
 
     # --- HELPERS ---
 
-    def extract_json_from_text(self, text):
-        try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            return None
-        except: return None
-
     def safe_exit(self):
         if self.exiting:
             return
@@ -315,8 +273,7 @@ class BotGUI:
             except: pass
 
         self.recording_active.clear()
-        self.thinking_sound_active.clear()
-        self.tts_active.clear() 
+        self.tts_active.clear()
         
         self.save_chat_history()
         
@@ -366,7 +323,6 @@ class BotGUI:
     def handle_speaking_interrupt(self, event=None):
         if self.current_state == BotStates.SPEAKING or self.current_state == BotStates.THINKING:
             self.interrupted.set()
-            self.thinking_sound_active.clear()
             with self.tts_queue_lock:
                 self.tts_queue.clear()
             if self.current_audio_process:
@@ -452,78 +408,6 @@ class BotGUI:
         self.master.after(0, update_text_stream)
 
     # =========================================================================
-    # 3. ACTION ROUTER
-    # =========================================================================
-    
-    def execute_action_and_get_result(self, action_data):
-        raw_action = action_data.get("action", "").lower().strip()
-        value = action_data.get("value") or action_data.get("query")
-        
-        VALID_TOOLS = {
-            "get_time", "search_web", "capture_image"
-        }
-        
-        ALIASES = {
-            "google": "search_web", "browser": "search_web", "news": "search_web",         
-            "search_news": "search_web", "look": "capture_image", "see": "capture_image", 
-            "check_time": "get_time"
-        }
-
-        action = ALIASES.get(raw_action, raw_action)
-        print(f"ACTION: {raw_action} -> {action}", flush=True)
-
-        if action not in VALID_TOOLS:
-            if value and isinstance(value, str) and len(value.split()) > 1:
-                return f"CHAT_FALLBACK::{value}"
-            return "INVALID_ACTION"
-
-        if action == "get_time":
-            now = datetime.datetime.now().strftime("%I:%M %p")
-            return f"The current time is {now}."
-        
-        elif action == "search_web":
-            print(f"Searching web for: {value}...", flush=True)
-            try:
-                # 'us-en' region is often more stable for CLI queries
-                with DDGS() as ddgs:
-                    results = []
-                    # 1. News search
-                    try:
-                        results = list(ddgs.news(value, region='us-en', max_results=1))
-                        if results: 
-                            print(f"[DEBUG] Found News: {results[0].get('title')}", flush=True)
-                    except Exception as e: 
-                        print(f"[DEBUG] News Search Error: {e}", flush=True)
-                    
-                    # 2. Text fallback
-                    if not results:
-                        print("[DEBUG] No news found, trying text search...", flush=True)
-                        try: 
-                            results = list(ddgs.text(value, region='us-en', max_results=1))
-                            if results: 
-                                print(f"[DEBUG] Found Text: {results[0].get('title')}", flush=True)
-                        except Exception as e:
-                             print(f"[DEBUG] Text Search Error: {e}", flush=True)
-
-                    if results:
-                        r = results[0]
-                        # Safe get
-                        title = r.get('title', 'No Title')
-                        body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{value}':\nTitle: {title}\nSnippet: {body[:300]}"
-                    else: 
-                        print(f"[DEBUG] Search returned 0 results.", flush=True)
-                        return "SEARCH_EMPTY"
-            except Exception as e:
-                print(f"[DEBUG] Connection/Library Error: {e}", flush=True)
-                return "SEARCH_ERROR"
-        
-        elif action == "capture_image":
-             return "IMAGE_CAPTURE_TRIGGERED"
-
-        return None
-
-    # =========================================================================
     # 4. CORE LOGIC
     # =========================================================================
 
@@ -561,7 +445,7 @@ class BotGUI:
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
                 with timed_block("完整一轮对话"):
-                    self.chat_and_respond(user_text, img_path=None)
+                    self.chat_and_respond(user_text)
                     
         except Exception as e:
             traceback.print_exc()
@@ -569,11 +453,26 @@ class BotGUI:
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
+        # 不只是载入权重，还要把第1轮真实会话要用的 KV 前缀（system prompt + 历史）
+        # 提前评估一遍，否则首轮 prompt-eval 会拖慢 LLM 首 Token（实测 ~16s）。
+        # 跑一次真实 ollama.chat，丢弃输出、不写入 memory，让真实第1轮退化成"第2轮"速度。
         try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
+            with timed_block("LLM warmup (prefix)"):
+                warmup_messages = self.permanent_memory + [
+                    {"role": "user", "content": "你好"}
+                ]
+                ollama.chat(
+                    model=TEXT_MODEL,
+                    messages=warmup_messages,
+                    stream=False,
+                    options=OLLAMA_OPTIONS,
+                    keep_alive=-1,
+                )
         except Exception as e:
             print(f"Failed to load {TEXT_MODEL}: {e}", flush=True)
-        self.play_sound(self.get_random_sound(greeting_sounds_dir))
+        # 档1: 原来播放英文游戏音效 greeting_sounds，改成中文开场问候（顺带预热首次 TTS 合成）。
+        # 档2 会把开场/过渡/收尾固定话术预合成为 wav 缓存，届时这里替换为直接播缓存。
+        self.speak("你好，我在。今天过得怎么样？")
         print("Models loaded.", flush=True)
 
     def detect_wake_word_or_ptt(self):
@@ -782,7 +681,7 @@ class BotGUI:
             wf.setsampwidth(2)
             wf.setframerate(samplerate)
             wf.writeframes(audio_data.tobytes())
-        self.play_sound(self.get_random_sound(ack_sounds_dir))
+        # 档1: 去掉录音结束后的英文确认音效（got_it.wav 等）；录音→思考的切换由 GUI 状态体现。
         return filename
 
     def transcribe_audio(self, filename):
@@ -809,56 +708,36 @@ class BotGUI:
             print(f"Transcription Error: {e}")
             return ""
 
-    def capture_image(self):
-        self.set_state(BotStates.CAPTURING, "Watching...")
-        try:
-            subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", BMO_IMAGE_FILE], check=True)
-            rotation = CURRENT_CONFIG.get("camera_rotation", 0)
-            if rotation != 0:
-                img = Image.open(BMO_IMAGE_FILE)
-                img = img.rotate(rotation, expand=True) 
-                img.save(BMO_IMAGE_FILE)
-            return BMO_IMAGE_FILE
-        except Exception as e:
-            print(f"Camera Error: {e}")
-            return None
-
     # =========================================================================
     # 5. CHAT & RESPOND
     # =========================================================================
 
-    def chat_and_respond(self, text, img_path=None):
-        if "forget everything" in text.lower() or "reset memory" in text.lower():
+    def chat_and_respond(self, text):
+        # 档1: 纯聊天路径。睡前梳理场景不需要工具调用（拍照/联网搜索已删除），
+        # 模型只负责"接住用户这一句"，直接流式输出 → TTS。
+        if "forget everything" in text.lower() or "reset memory" in text.lower() \
+                or "清空记忆" in text or "忘记一切" in text:
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
-            with self.tts_queue_lock: 
-                self.tts_queue.append("Okay. Memory wiped.")
+            with self.tts_queue_lock:
+                self.tts_queue.append("好的，我把记忆清空了。")
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
-        model_to_use = VISION_MODEL if img_path else TEXT_MODEL
-        self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
-        
-        messages = []
-        if img_path:
-            messages = [{"role": "user", "content": text, "images": [img_path]}]
-        else:
-            lang = CURRENT_CONFIG.get("whisper_lang", "en")
-            lang_hint = "请用中文回答。" if lang == "zh" else ""
-            user_msg = {"role": "user", "content": text + ("\n" + lang_hint if lang_hint else "")}
-            messages = self.permanent_memory + self.session_memory + [user_msg]
-        
-        self.thinking_sound_active.set()
-        threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
-        
+        self.set_state(BotStates.THINKING, "Thinking...")
+
+        lang = CURRENT_CONFIG.get("whisper_lang", "en")
+        lang_hint = "请用中文回答。" if lang == "zh" else ""
+        user_msg = {"role": "user", "content": text + ("\n" + lang_hint if lang_hint else "")}
+        messages = self.permanent_memory + self.session_memory + [user_msg]
+
         full_response_buffer = ""
-        sentence_buffer = "" 
-        
+        sentence_buffer = ""
+
         try:
-            stream = ollama.chat(model=model_to_use, messages=messages, stream=True, options=OLLAMA_OPTIONS)
-            
-            is_action_mode = False
+            stream = ollama.chat(model=TEXT_MODEL, messages=messages, stream=True, options=OLLAMA_OPTIONS)
+
             _t_llm = time.perf_counter()
             _ttft_logged = False
 
@@ -869,98 +748,25 @@ class BotGUI:
                     print(f"[TIMER] LLM 首Token延迟 {time.perf_counter()-_t_llm:.2f}s", flush=True)
                     _ttft_logged = True
                 full_response_buffer += content
-                
-                if '{"' in content or "action:" in content.lower():
-                    is_action_mode = True
-                    self.thinking_sound_active.clear()
-                    continue 
 
-                if is_action_mode: continue
-
-                self.thinking_sound_active.clear()
                 if self.current_state != BotStates.SPEAKING:
-                    self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                    self.set_state(BotStates.SPEAKING, "Speaking...")
                     self.append_to_text("BOT: ", newline=False)
 
                 self._stream_to_text(content)
-                
+
                 sentence_buffer += content
-                if any(punct in content for punct in ".!?\n"):
+                if any(punct in content for punct in ".!?\n。！？"):
                     clean_sentence = sentence_buffer.strip()
                     if clean_sentence and re.search(r'[\w一-鿿]', clean_sentence):
                         with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
                     sentence_buffer = ""
 
-            if is_action_mode:
-                action_data = self.extract_json_from_text(full_response_buffer)
-                if action_data:
-                    tool_result = self.execute_action_and_get_result(action_data)
+            if sentence_buffer.strip() and re.search(r'[\w一-鿿]', sentence_buffer):
+                with self.tts_queue_lock: self.tts_queue.append(sentence_buffer.strip())
+            self.append_to_text("")
+            self.session_memory.append({"role": "assistant", "content": full_response_buffer})
 
-                    if tool_result and tool_result.startswith("CHAT_FALLBACK::"):
-                        chat_text = tool_result.split("::", 1)[1]
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(chat_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(chat_text)
-                        self.session_memory.append({"role": "assistant", "content": chat_text})
-                        self.wait_for_tts()
-                        self.set_state(BotStates.IDLE, "Ready")
-                        return
-
-                    if tool_result == "IMAGE_CAPTURE_TRIGGERED":
-                        new_img_path = self.capture_image()
-                        if new_img_path:
-                            self.chat_and_respond(text, img_path=new_img_path)
-                            return 
-
-                    elif tool_result == "INVALID_ACTION":
-                        fallback_text = "I am not sure how to do that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
-
-                    elif tool_result == "SEARCH_EMPTY":
-                        fallback_text = "I searched, but I couldn't find any news about that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
-
-                    elif tool_result == "SEARCH_ERROR":
-                        fallback_text = "I cannot reach the internet right now."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
-
-                    elif tool_result:
-                        summary_prompt = [
-                            {"role": "system", "content": "Summarize this result in one short sentence."},
-                            {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
-                        ]
-                        
-                        self.set_state(BotStates.THINKING, "Reading...")
-                        self.thinking_sound_active.set()
-                        
-                        final_resp = ollama.chat(model=model_to_use, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
-                        final_text = final_resp['message']['content']
-                        
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(final_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(final_text)
-                        self.session_memory.append({"role": "assistant", "content": final_text})
-            else:
-                self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer}) 
-            
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
                 
@@ -985,12 +791,90 @@ class BotGUI:
                 self.tts_active.clear() 
             else: time.sleep(0.05)
 
+    def _init_sherpa_tts(self):
+        try:
+            import sherpa_onnx
+            model_dir = CURRENT_CONFIG.get("sherpa_model_dir", "sherpa-models/vits-zh-aishell3")
+            cfg = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                        model=f"{model_dir}/vits-aishell3.int8.onnx",
+                        lexicon=f"{model_dir}/lexicon.txt",
+                        tokens=f"{model_dir}/tokens.txt",
+                    ),
+                ),
+                rule_fsts=(
+                    f"{model_dir}/date.fst,"
+                    f"{model_dir}/number.fst,"
+                    f"{model_dir}/phone.fst,"
+                    f"{model_dir}/new_heteronym.fst"
+                ),
+                rule_fars=f"{model_dir}/rule.far",
+                max_num_sentences=1,
+            )
+            self.sherpa_tts = sherpa_onnx.OfflineTts(cfg)
+            print("[INIT] Sherpa TTS loaded.", flush=True)
+        except Exception as e:
+            print(f"[INIT] Sherpa TTS load failed: {e}. Falling back to piper.", flush=True)
+            self.sherpa_tts = None
+
     def speak(self, text):
         clean = re.sub(r"[^\w\s,.!?:-，。！？、；：]", "", text)
         if not clean.strip(): return
+        if self.sherpa_tts is not None:
+            self._speak_sherpa(clean)
+        else:
+            self._speak_piper(clean)
 
-        with timed_block(f"TTS piper [{clean[:15]}...]"):
-            print(f"[PIPER SPEAKING] '{clean}'", flush=True)
+    def _speak_sherpa(self, text):
+        with timed_block(f"TTS sherpa [{text[:15]}...]"):
+            print(f"[SHERPA TTS] '{text}'", flush=True)
+            try:
+                audio = self.sherpa_tts.generate(
+                    text,
+                    sid=CURRENT_CONFIG.get("sherpa_speaker_id", 0),
+                    speed=CURRENT_CONFIG.get("sherpa_speed", 1.0),
+                )
+                samples = np.array(audio.samples, dtype=np.float32)
+                # Normalize to [-1, 1] so quiet model output plays at full volume
+                max_val = np.max(np.abs(samples))
+                if max_val > 0:
+                    samples /= max_val
+
+                playback_rate = audio.sample_rate
+                try:
+                    sd.check_output_settings(samplerate=playback_rate)
+                except Exception:
+                    try:
+                        native_rate = int(sd.query_devices(kind='output')['default_samplerate'])
+                    except Exception:
+                        native_rate = 48000
+                    num_samples = int(len(samples) * (native_rate / playback_rate))
+                    samples = scipy.signal.resample(samples, num_samples).astype(np.float32)
+                    playback_rate = native_rate
+
+                sd.play(samples, playback_rate)
+                while True:
+                    time.sleep(0.05)
+                    if self.interrupted.is_set():
+                        sd.stop()
+                        break
+                    try:
+                        if not sd.get_stream().active:
+                            sd.stop()
+                            break
+                    except Exception:
+                        break
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"[SHERPA TTS ERROR] {e}, falling back to piper")
+                self._speak_piper(text)
+            finally:
+                self.current_volume = 0
+
+    def _speak_piper(self, text):
+        with timed_block(f"TTS piper [{text[:15]}...]"):
+            print(f"[PIPER SPEAKING] '{text}'", flush=True)
             voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
 
             try:
@@ -1001,7 +885,7 @@ class BotGUI:
                     stderr=subprocess.DEVNULL
                 )
 
-                self.current_audio_process.stdin.write(clean.encode() + b'\n')
+                self.current_audio_process.stdin.write(text.encode() + b'\n')
                 self.current_audio_process.stdin.close()
 
                 try:
@@ -1046,22 +930,9 @@ class BotGUI:
                     if self.current_audio_process.poll() is None: self.current_audio_process.terminate()
                     self.current_audio_process = None
 
-    def _run_thinking_sound_loop(self):
-        time.sleep(0.5)
-        while self.thinking_sound_active.is_set():
-            sound = self.get_random_sound(thinking_sounds_dir)
-            if sound: self.play_sound(sound)
-            for _ in range(50):
-                if not self.thinking_sound_active.is_set(): return
-                time.sleep(0.1)
-
-    def get_random_sound(self, directory):
-        if os.path.exists(directory):
-            files = [f for f in os.listdir(directory) if f.endswith(".wav")]
-            return os.path.join(directory, random.choice(files)) if files else None
-        return None
-
     def play_sound(self, file_path):
+        # 通用 wav 播放器（档2 放松音频会复用）。
+
         if not file_path or not os.path.exists(file_path): return
         try:
             with wave.open(file_path, 'rb') as wf:

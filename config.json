@@ -1,13 +1,14 @@
 {
   "text_model": "gemma3:1b",
-  "vision_model": "moondream",
   "voice_model": "piper/zh_CN-huayan-medium.onnx",
+  "tts_engine": "sherpa",
+  "sherpa_model_dir": "sherpa-models/vits-zh-aishell3",
+  "sherpa_speaker_id": 0,
+  "sherpa_speed": 1.0,
   "chat_memory": true,
-  "camera_rotation": 180,
-  "system_prompt": "你是一个运行在树莓派上的桌面陪伴助手，性格温和礼貌。你有以下工具可以使用，需要时请只回复JSON格式，不要有其他文字：\n\n1. 查看时间: {\"action\": \"get_time\"}\n2. 拍照: {\"action\": \"capture_image\"}\n3. 网络搜索: {\"action\": \"search_web\", \"query\": \"搜索内容\"}\n\n 使用中文作答，语气平和自然，不超过两句话。",
+  "system_prompt": "你是一个睡前陪伴机器人，帮用户在睡前梳理情绪。说话温和、简短，每次回应不超过两句话。只负责接住用户当下这一句，不出主意、不深挖、不在睡前帮用户解决烦心事；用户提到烦心事就先“寄存”——记下了，明天再想。",
   "system_prompt_extras": "",
   "input_device": null,
   "input_sample_rate": 44100,
   "whisper_model": "ggml-base.bin",
-  "whisper_lang": "zh"
-}
+  "whisper_lang": "zh"}
