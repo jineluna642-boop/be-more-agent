@@ -143,5 +143,6 @@ class BotStates:
     LISTENING = "listening"
     THINKING = "thinking"
     SPEAKING = "speaking"
-    ERROR = "error"
     WARMUP = "warmup"
+    GREETING = "greeting"
+    SLEEP = "sleep"

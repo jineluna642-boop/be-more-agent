@@ -124,7 +124,7 @@ class BotGUI:
 
         # GUI Setup
         self.background_label = tk.Label(master)
-        self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
+        self.background_label.place(x=0, y=15, width=self.BG_WIDTH, height=450)
         self.background_label.bind('<Button-1>', self.toggle_hud_visibility)
 
         self.response_text = tk.Text(master, height=6, width=60, wrap=tk.WORD,
@@ -218,41 +218,32 @@ class BotGUI:
 
     def load_animations(self):
         base_path = "faces"
-        states = ["idle", "listening", "thinking", "speaking", "error", "warmup"]
+        states = ["idle", "listening", "thinking", "speaking", "greeting", "sleep", "warmup"]
         for state in states:
             folder = os.path.join(base_path, state)
             self.animations[state] = []
             if os.path.exists(folder):
                 files = sorted([f for f in os.listdir(folder) if f.lower().endswith('.png')])
                 for f in files:
-                    img = Image.open(os.path.join(folder, f)).resize((self.BG_WIDTH, self.BG_HEIGHT))
+                    img = Image.open(os.path.join(folder, f)).resize((800, 450), Image.NEAREST)
                     self.animations[state].append(ImageTk.PhotoImage(img))
             if not self.animations[state]:
-                if state in self.animations.get("idle", []):
+                if "idle" in self.animations and self.animations["idle"]:
                      self.animations[state] = self.animations["idle"]
                 else:
-                    # Blue screen fallback
-                    blank = Image.new('RGB', (self.BG_WIDTH, self.BG_HEIGHT), color='#0000FF')
+                    blank = Image.new('RGB', (800, 450), color='#1a1a2e')
                     self.animations[state].append(ImageTk.PhotoImage(blank))
 
     def update_animation(self):
         frames = self.animations.get(self.current_state, []) or self.animations.get(BotStates.IDLE, [])
         if not frames:
-            self.master.after(500, self.update_animation)
+            self.master.after(250, self.update_animation)
             return
 
-        if self.current_state == BotStates.SPEAKING:
-            if len(frames) > 1:
-                self.current_frame_index = random.randint(1, len(frames) - 1)
-            else:
-                self.current_frame_index = 0 
-        else:
-            self.current_frame_index = (self.current_frame_index + 1) % len(frames)
-
+        self.current_frame_index = (self.current_frame_index + 1) % len(frames)
         self.background_label.config(image=frames[self.current_frame_index])
-        
-        speed = 50 if self.current_state == BotStates.SPEAKING else 500
-        self.master.after(speed, self.update_animation)
+
+        self.master.after(250, self.update_animation)
 
     def set_state(self, state, msg=""):
         def _update():
