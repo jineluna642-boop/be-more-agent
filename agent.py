@@ -816,7 +816,6 @@ class BotGUI:
                     # 默认单线程合成在 Pi 上慢到 ~0.5s/字；吃满多核可砍掉一半以上耗时。
                     num_threads=num_threads,
                     provider="cpu",
-                    debug=True,   # 排查用：初始化时打印实际生效的 config（含 num_threads）
                 ),
                 rule_fsts=(
                     f"{model_dir}/date.fst,"
