@@ -12,7 +12,7 @@
   "input_sample_rate": 44100,
   "whisper_model": "ggml-base.bin",
   "whisper_lang": "zh",
-  "vad_aggressiveness": 2,
+  "vad_aggressiveness": 3,
   "vad_start_ms": 150,
   "vad_silence_ms": 900,
   "vad_max_record_ms": 30000,

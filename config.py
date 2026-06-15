@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "whisper_model": "ggml-base.en.bin",
     "whisper_lang": "en",
     # --- VAD（免手持续监听）---
-    "vad_aggressiveness": 2,   # webrtcvad 灵敏度 0~3，越大越严格（越不易把噪声当人声）
+    "vad_aggressiveness": 3,   # webrtcvad 灵敏度 0~3，越大越严格（越不易把噪声当人声）
     "vad_start_ms": 150,       # 连续多少毫秒判定为人声才算"开始说话"（防瞬时噪声误触发）
     "vad_silence_ms": 900,     # 尾部静音多久判定"说完"
     "vad_max_record_ms": 30000,# 单次最长录音
