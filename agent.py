@@ -59,13 +59,16 @@ class BotGUI:
     def __init__(self, master):
         self.master = master
         master.title("Pi Assistant")
-        master.attributes('-fullscreen', True) 
-        master.bind('<Escape>', self.exit_fullscreen)
-        
+        master.attributes('-fullscreen', True)
+        self.is_fullscreen = True
+        master.bind('<Escape>', self.toggle_fullscreen)   # 只切换全屏，不退程序
+        master.bind('<Control-q>', lambda e: self.safe_exit())  # 退出程序
+
         # Inputs
         master.bind('<Return>', self.handle_ptt_toggle)
         master.bind('<space>', self.handle_speaking_interrupt)
         atexit.register(self.safe_exit)
+        master.focus_force()   # 抢焦点，确保 Escape 等按键能被窗口收到
         
         # State
         self.current_state = BotStates.WARMUP
@@ -167,9 +170,10 @@ class BotGUI:
         except Exception:
             pass
         
-    def exit_fullscreen(self, event=None):
-        self.master.attributes('-fullscreen', False)
-        self.safe_exit()
+    def toggle_fullscreen(self, event=None):
+        # Escape：在全屏 / 窗口化之间切换，程序继续运行（退出请用 Ctrl+Q 或 Exit 按钮）。
+        self.is_fullscreen = not self.is_fullscreen
+        self.master.attributes('-fullscreen', self.is_fullscreen)
 
     def toggle_hud_visibility(self, event=None):
         try:
